@@ -1,15 +1,21 @@
 package esri.arcgis.flutter_plugin
 
 import android.content.Context
+import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
 import com.esri.arcgisruntime.ArcGISRuntimeEnvironment
+import com.esri.arcgisruntime.concurrent.Job
+import com.esri.arcgisruntime.data.VectorTileCache
 import com.esri.arcgisruntime.layers.ArcGISVectorTiledLayer
 import com.esri.arcgisruntime.mapping.ArcGISMap
 import com.esri.arcgisruntime.mapping.Basemap
 import com.esri.arcgisruntime.mapping.Viewpoint
 import com.esri.arcgisruntime.mapping.view.AnimationCurve
 import com.esri.arcgisruntime.mapping.view.MapView
+import com.esri.arcgisruntime.tasks.vectortilecache.ExportVectorTilesJob
+import com.esri.arcgisruntime.tasks.vectortilecache.ExportVectorTilesParameters
+import com.esri.arcgisruntime.tasks.vectortilecache.ExportVectorTilesTask
 import esri.arcgis.flutter_plugin.model.AnimationOptions
 import esri.arcgis.flutter_plugin.model.ArcgisMapOptions
 import esri.arcgis.flutter_plugin.model.LatLng
@@ -19,6 +25,9 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.platform.PlatformView
+import java.io.File
+import java.util.*
+import kotlin.concurrent.timerTask
 import kotlin.math.exp
 import kotlin.math.ln
 import kotlin.math.roundToInt
@@ -37,6 +46,7 @@ internal class ArcgisMapView(
     private val view: View = LayoutInflater.from(context).inflate(R.layout.vector_map_view, null)
     private var mapView: MapView
     private val map = ArcGISMap()
+    private var vectorTileCacheFile: File
 
     private lateinit var zoomStreamHandler: ZoomStreamHandler
 
@@ -49,11 +59,23 @@ internal class ArcgisMapView(
         ArcGISRuntimeEnvironment.setApiKey(mapOptions.apiKey)
         mapView = view.findViewById(R.id.mapView)
 
+        val tileCacheDir = File(context.cacheDir.path, "tile-cache")
+        tileCacheDir.mkdir()
+        vectorTileCacheFile = File(tileCacheDir, "myTileCache.vtpk")
+
         if (mapOptions.basemap != null) {
             map.basemap = Basemap(mapOptions.basemap)
         } else {
             val layers = mapOptions.vectorTilesUrls.map { url -> ArcGISVectorTiledLayer(url) }
-
+                .toMutableList()
+            if (vectorTileCacheFile.exists()) {
+                val cacheLayer = ArcGISVectorTiledLayer(VectorTileCache(vectorTileCacheFile.path))
+                layers.add(0, cacheLayer)
+            } else {
+                Timer().schedule(timerTask {
+                    downloadVectorTile(mapOptions.vectorTilesUrls.first())
+                }, 4000)
+            }
             map.basemap = Basemap(layers, null)
         }
 
@@ -77,6 +99,82 @@ internal class ArcgisMapView(
 
         setupMethodChannel()
         setupEventChannel()
+    }
+
+
+    private lateinit var exportTask: ExportVectorTilesTask
+    var job: ExportVectorTilesJob? = null
+
+    private fun downloadVectorTile(url: String) {
+        /*
+         From the tutorial:
+         Create an AGSArcGISVectorTiledLayer, from the map's base layers.
+         Create an AGSExportVectorTilesTask using the vector tiled layer's URL.
+         Create default AGSExportVectorTilesParameters from the task, specifying extent and maximum scale.
+         Create an AGSExportVectorTilesJob from the task using the parameters, specifying a vector tile cache path, and an item resource path. The resource path is required if you want to export the tiles with the style.
+         Start the job, and once it completes successfully, get the resulting AGSExportVectorTilesResult.
+         Get the AGSVectorTileCache and AGSItemResourceCache from the result to create an AGSArcGISVectorTiledLayer that can be displayed to the map view.
+         */
+
+        // Set the max scale parameter to 7% of the map's scale to limit
+        // number of tiles exported to within the vector tiled layer's max tile export limit.
+        val maxScale = mapView.mapScale * 0.07
+        // Get current area of interest marked by the extent view.
+        val areaOfInterest = mapView.visibleArea.extent
+
+        // Get the parameters by specifying the selected area and vector tiled layer's max scale as maxScale.
+        exportTask = ExportVectorTilesTask(url)
+        exportTask.addDoneLoadingListener {
+            val vectorTileInfo = exportTask.vectorTileSourceInfo
+
+            Log.d("TILES", "Exporing with ${areaOfInterest.center} and maxScale: ${maxScale}")
+            Log.d("TILES", "Vector tile source: $vectorTileInfo")
+            Log.d("TILES", "Allows export: ${vectorTileInfo.canExportTiles()}")
+            val createDefaultTilesListener =
+                exportTask.createDefaultExportVectorTilesParametersAsync(areaOfInterest, maxScale)
+            createDefaultTilesListener.addDoneListener() {
+                this.exportVectorTiles(exportTask, parameters = createDefaultTilesListener.get())
+            }
+        }
+
+        exportTask.loadAsync()
+    }
+
+    private fun exportVectorTiles(
+        exportTask: ExportVectorTilesTask,
+        parameters: ExportVectorTilesParameters
+    ) {
+        Log.d("TILES", "Creating job...")
+        val job = exportTask.exportVectorTiles(parameters, vectorTileCacheFile.path)
+
+        this.job = job
+        // Start the job.
+        job.addProgressChangedListener {
+            val progress = job.progress
+            Log.d("TILES", "Job Progress: $progress")
+        }
+
+        job.addJobDoneListener {
+            Log.d("TILES", "Job Progress: ${job.progress}%")
+        }
+        job.addJobChangedListener {
+            when (job.status) {
+                Job.Status.SUCCEEDED -> {
+                    this.job = null
+                    val tileCache = job.result.vectorTileCache
+                    Log.d("TILES", "Download done: ${tileCache.path}")
+
+                    // Create the vector tiled layer with the tile cache and item resource cache.
+                    val vectorTiledLayer = ArcGISVectorTiledLayer(tileCache)
+                }
+                Job.Status.FAILED -> {
+                    this.job = null
+                    Log.d("TILES", "Job Failed: ${job.result} ${job.error}")
+                }
+                else -> {}
+            }
+        }
+        job.start()
     }
 
     override fun dispose() {}
